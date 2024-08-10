@@ -1,5 +1,7 @@
 import math
 from dataclasses import dataclass
+
+import tiktoken
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -14,7 +16,7 @@ class GPTConfig:
     n_embd: int = 768
 
 
-class CasualSelfAttention(nn.Module):
+class CausalSelfAttention(nn.Module):
     def __init__(self, config: GPTConfig):
         super().__init__()
         assert config.n_embd % config.n_head == 0
@@ -68,7 +70,7 @@ class Block(nn.Module):
     def __init__(self, config: GPTConfig):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embd)
-        self.attn = CasualSelfAttention(config)
+        self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
 
@@ -90,6 +92,24 @@ class GPT(nn.Module):
             ln_f = nn.LayerNorm(config.n_embd), # layernorm
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False) # language model head
+
+    def forward(self, idx):
+        # idx is of shape (B, T)
+        B, T = idx.size()
+        assert T <= self.config.block_size
+        # forward the token and positions embeddings
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
+        pos_emb = self.transformer.wpe(pos) # shape (T, n_embd)
+        tok_emb = self.transformer.wte(idx) # shape (B, T, n_embd)
+        x = tok_emb + pos_emb
+        # forward the blocks of the transformers
+        for block in self.transformer.h:
+            x = block(x)
+        # forward the final layernorm and the classifier
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x) # (B, T, vocab_size)
+        return logits
+
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -141,5 +161,40 @@ class GPT(nn.Module):
         return model
 
 
+num_return_sequences = 5
+max_length = 30
+
 model = GPT.from_pretrained('gpt2')
-print('did not crash')
+model.eval()
+model.to('cuda')
+
+# prefix tokens
+enc = tiktoken.get_encoding('gpt2')
+tokens = enc.encode("Hello, I'm a language model,")
+tokens = torch.tensor(tokens, dtype=torch.long)
+tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+x = tokens.to('cuda')
+
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+while x.size(1) < max_length:
+    # forward the model to get the logis
+    with torch.no_grad():
+        logits = model(x)
+        # takes the logits in the last position
+        logits = logits[:, -1, :]
+        # get probabilities
+        probs = F.softmax(logits, dim=-1)
+        # do top-k sampling of 50
+        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+        # select a token from the top-k probabilities
+        ix = torch.multinomial(topk_probs, num_samples=1)
+        # gather the corresponding indices
+        xcol = torch.gather(topk_indices, -1, ix)
+        # append
+        x = torch.cat((x, xcol), dim=1)
+
+for i in range(num_return_sequences):
+    tokens = x[i, :max_length].tolist()
+    decoded = enc.decode(tokens)
+    print(decoded)
