@@ -224,7 +224,9 @@ model = GPT(GPTConfig())
 model.eval()
 model.to(device)
 
-train_loader = DataLoaderLite(B=4, T=32)
+train_loader = DataLoaderLite(B=4, T=1024)
+
+torch.set_float32_matmul_precision('high')
 
 model = GPT(GPTConfig())
 model.to(device)
