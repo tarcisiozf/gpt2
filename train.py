@@ -1,4 +1,5 @@
 import math
+import time
 from dataclasses import dataclass
 
 import tiktoken
@@ -237,6 +238,7 @@ model = torch.compile(model)
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range(50):
+    t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
@@ -244,7 +246,11 @@ for i in range(50):
         logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
-    print(f"step {i+1} loss: {loss.item()}")
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    dt = time.time() - t0
+    tokens_per_sec = (train_loader.B * train_loader.T) / dt
+    print(f"step {i+1} loss: {loss.item()} dt: {dt*1000:.2f} tokens/sec {tokens_per_sec:.2f}")
 
 import sys; sys.exit(0)
 
