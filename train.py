@@ -1,5 +1,6 @@
 import inspect
 import math
+import os
 import time
 from dataclasses import dataclass
 
@@ -212,34 +213,61 @@ class GPT(nn.Module):
         return model
 
 class DataLoaderLite:
-    def __init__(self, B, T):
+    def __init__(self, B, T, process_rank, num_procs):
         self.B = B
         self.T = T
+        self.process_rank = process_rank
+        self.num_procs = num_procs
 
         with open('input.txt', 'r') as f:
             text = f.read()
         enc = tiktoken.get_encoding('gpt2')
         tokens = enc.encode(text)
         self.tokens = torch.tensor(tokens)
-        self.current_position = 0
+        self.current_position = self.B * self.T * self.process_rank
 
     def next_batch(self):
         B, T = self.B, self.T
         buf = self.tokens[self.current_position:self.current_position + B*T + 1]
         x = (buf[:-1]).view(B, T)
         y = (buf[1:]).view(B, T)
-        self.current_position += B*T
+        self.current_position += B*T*self.num_procs
         # if out of bounds, reset
-        if self.current_position + (B*T+1) > len(self.tokens):
-            self.current_position = 0
+        if self.current_position + (B*T*self.num_procs+1) > len(self.tokens):
+            self.current_position = self.B * self.T * self.process_rank
         return x, y
 
-device = "cpu"
-if torch.cuda.is_available():
-    device = "cuda"
-elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    device = "mps"
-print("Device: %s" % device)
+# run the training loop
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+
+# set up DDP (distributed data parallel).
+# torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
+ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+if ddp:
+    # use of DDP atm demands CUDA, we set the device appropriately according to rank
+    assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+else:
+    # vanilla, non-DDP run
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    # attempt to autodetect device
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    print(f"using device: {device}")
 
 torch.manual_seed(1337)
 if torch.cuda.is_available():
@@ -248,18 +276,21 @@ if torch.cuda.is_available():
 total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
 B = 4 # micro batch size
 T = 256 # sequence length
-assert total_batch_size % (B*T) == 0
-grad_accum_steps = total_batch_size // (B*T)
-print("Total desired batch size: %d" % total_batch_size)
-print("Grad-accum-steps: %d" % grad_accum_steps)
+assert total_batch_size % (B*T*ddp_world_size) == 0
+grad_accum_steps = total_batch_size // (B*T*ddp_world_size)
+if master_process:
+    print("Total desired batch size: %d" % total_batch_size)
+    print("Grad-accum-steps: %d" % grad_accum_steps)
 
-train_loader = DataLoaderLite(B=B, T=T) # on bigger gpus:  16, 1024
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_procs=ddp_world_size) # on bigger gpus:  16, 1024
 
 torch.set_float32_matmul_precision('high')
 
 model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
 model = torch.compile(model)
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
@@ -293,18 +324,26 @@ for i in range(max_steps):
             logits, loss = model(x, y)
         loss = loss / grad_accum_steps
         loss_accum += loss.detach()
+        if ddp:
+            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
         loss.backward()
+    if ddp:
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.SUM)
     norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # grad norm
     # determine and set the learning rate for this iteration
     lr = get_lr(i)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
     optimizer.step()
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    dt = time.time() - t0
-    tokens_per_sec = (train_loader.B * train_loader.T * grad_accum_steps) / dt
-    print(f"step {i+1} | loss: {loss_accum.item()} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f} | tokens/sec {tokens_per_sec:.2f}")
+    if master_process:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        dt = time.time() - t0
+        tokens_per_sec = (train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size) / dt
+        print(f"step {i+1} | loss: {loss_accum.item()} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f} | tokens/sec {tokens_per_sec:.2f}")
+
+if ddp:
+    destroy_process_group()
 
 import sys; sys.exit(0)
 
