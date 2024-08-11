@@ -291,6 +291,7 @@ model.to(device)
 model = torch.compile(model)
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module if ddp else model # unwrap
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
@@ -311,7 +312,7 @@ def get_lr(it):
 
 # optimize!
 # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
-optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device)
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device)
 
 for i in range(max_steps):
     t0 = time.time()
