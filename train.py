@@ -224,7 +224,7 @@ model = GPT(GPTConfig())
 model.eval()
 model.to(device)
 
-train_loader = DataLoaderLite(B=4, T=1024)
+train_loader = DataLoaderLite(B=4, T=256)
 
 torch.set_float32_matmul_precision('high')
 
@@ -236,7 +236,8 @@ for i in range(50):
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
     print(f"step {i+1} loss: {loss.item()}")
