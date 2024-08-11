@@ -245,15 +245,15 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
-num_return_sequences = 5
-max_length = 30
+total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
+B = 4 # micro batch size
+T = 256 # sequence length
+assert total_batch_size % (B*T) == 0
+grad_accum_steps = total_batch_size // (B*T)
+print("Total desired batch size: %d" % total_batch_size)
+print("Grad-accum-steps: %d" % grad_accum_steps)
 
-# model = GPT.from_pretrained('gpt2')
-model = GPT(GPTConfig())
-model.eval()
-model.to(device)
-
-train_loader = DataLoaderLite(B=4, T=256) # on bigger gpus:  16, 1024
+train_loader = DataLoaderLite(B=B, T=T) # on bigger gpus:  16, 1024
 
 torch.set_float32_matmul_precision('high')
 
@@ -284,12 +284,16 @@ optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, dev
 
 for i in range(max_steps):
     t0 = time.time()
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        logits, loss = model(x, y)
-    loss.backward()
+    loss_accum = 0.0
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+        loss = loss / grad_accum_steps
+        loss_accum += loss.detach()
+        loss.backward()
     norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # grad norm
     # determine and set the learning rate for this iteration
     lr = get_lr(i)
@@ -299,10 +303,18 @@ for i in range(max_steps):
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     dt = time.time() - t0
-    tokens_per_sec = (train_loader.B * train_loader.T) / dt
-    print(f"step {i+1} | loss: {loss.item()} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f} | tokens/sec {tokens_per_sec:.2f}")
+    tokens_per_sec = (train_loader.B * train_loader.T * grad_accum_steps) / dt
+    print(f"step {i+1} | loss: {loss_accum.item()} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f} | tokens/sec {tokens_per_sec:.2f}")
 
 import sys; sys.exit(0)
+
+num_return_sequences = 5
+max_length = 30
+
+# model = GPT.from_pretrained('gpt2')
+model = GPT(GPTConfig())
+model.eval()
+model.to(device)
 
 torch.manual_seed(42)
 torch.cuda.manual_seed(42)
